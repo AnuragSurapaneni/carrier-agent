@@ -51,6 +51,23 @@ Check that it is running in another terminal:
 curl http://127.0.0.1:8000/health
 ```
 
+## Expose the API with ngrok
+
+For a temporary public endpoint, leave the middleware running locally and start an ngrok HTTP tunnel in a second terminal:
+
+```sh
+ngrok http 8000
+```
+
+Copy the HTTPS forwarding address printed by ngrok. Set it as the agent's base URL before starting the agent:
+
+```sh
+export CARRIER_API_BASE="https://your-ngrok-domain.ngrok-free.app"
+sh ./agent/setup.sh
+```
+
+Replace the example address with the one ngrok assigned to your tunnel. Keep both the middleware and tunnel running while the remote client uses it; a temporary ngrok address can change when the tunnel restarts. Treat the URL as public: protected API routes still require the configured `CARRIER_API_KEY`, but health checks and FastAPI's documentation pages are public. Keep test carriers, test loads, and `/tms-raw` disabled, and never put API keys in the URL. An ngrok tunnel is useful for development and demos; it does not provide persistent application hosting.
+
 To run the local agent, set `OPENAI_API_KEY` in `.env`, keep the API server running, then start the agent from the repository root:
 
 ```sh
