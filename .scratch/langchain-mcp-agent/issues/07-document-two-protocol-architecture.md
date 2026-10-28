@@ -7,10 +7,14 @@
 - 05: Rebuild the agent on LangChain over MCP
 - 06: Structured call summary
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] The README has an architecture section covering the two protocols, the shared core, and how to point an external MCP client at the server
 - [ ] The README's project layout, agent, and dependency descriptions match the new reality (core modules, MCP module, LangChain agent over MCP)
 - [ ] The env template documents the MCP path
 - [ ] The Dockerfile is unchanged (same image, same port)
 - [ ] All test suites (HTTP + MCP) remain green
+
+## Comments
+
+- 2026-10-29: Resolved — merged into `int/langchain-mcp-agent` at `95debe4` (two-axis code review passed; branch fix pass `f3a2eda`).

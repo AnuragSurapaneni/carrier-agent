@@ -21,7 +21,7 @@ The test-carrier and test-load fixtures are env-flag gated and the app reads tho
 - 02: Add exact-pinned AI dependencies
 - 03: Extract framework-agnostic core layer
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] `list_tools` against the MCP surface returns exactly the six expected tools with the expected names
 - [ ] Tool names, descriptions, and pre-existing parameter names match the current agent tool definitions (docstrings byte-identical to the tool descriptions)
@@ -31,3 +31,7 @@ The test-carrier and test-load fixtures are env-flag gated and the app reads tho
 - [ ] Health, root, and the raw TMS passthrough are not exposed as MCP tools
 - [ ] The server remains launchable over stdio
 - [ ] The three HTTP suites remain green (one system of record, two protocols, no forked state)
+
+## Comments
+
+- 2026-10-29: Resolved — merged into `int/langchain-mcp-agent` at `b5183e0` (two-axis code review passed; branch fix pass `f3a2eda`).

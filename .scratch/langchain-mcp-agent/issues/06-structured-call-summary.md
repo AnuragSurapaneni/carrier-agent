@@ -6,7 +6,7 @@
 - 02: Add exact-pinned AI dependencies
 - 05: Rebuild the agent on LangChain over MCP
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] The extraction uses LangChain structured output with a Pydantic model (no hand-parsed `json_object`)
 - [ ] Summaries are written to the existing SQLite call-log table with the unchanged schema and the same fields
@@ -14,3 +14,7 @@
 - [ ] The extraction function accepts an optional injected model
 - [ ] One fake-model test pins the CallSummary → SQLite shape with no LLM call
 - [ ] The existing test suites (HTTP + MCP) remain green
+
+## Comments
+
+- 2026-10-29: Resolved — merged into `int/langchain-mcp-agent` at `05b3db4` (two-axis code review passed; branch fix pass `f3a2eda`).

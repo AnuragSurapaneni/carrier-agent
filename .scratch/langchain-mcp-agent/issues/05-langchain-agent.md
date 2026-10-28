@@ -10,7 +10,7 @@ The agent keeps generating a per-call run id and passes it to every MCP tool cal
 - 02: Add exact-pinned AI dependencies
 - 04: MCP server surface + in-memory test suite
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] The agent is built with the canonical agent API (`create_agent` + `init_chat_model` from `AGENT_MODEL`, temperature 0.3)
 - [ ] The six middleware tools arrive from the MCP server via the standard adapter over streamable HTTP; the API key is sent as a static header from `CARRIER_API_KEY`
@@ -21,3 +21,7 @@ The agent keeps generating a per-call run id and passes it to every MCP tool cal
 - [ ] No raw HTTP calls to the middleware and no hand-rolled tool schemas remain in the agent
 - [ ] The existing test suites (HTTP + MCP) remain green
 - [ ] Clear human-run instructions exist for the manual smoke call (test carrier `9999901`, code `424242`: verify → code → search → negotiate → book → transfer)
+
+## Comments
+
+- 2026-10-29: Resolved — merged into `int/langchain-mcp-agent` at `54d2bd9` (two-axis code review passed; branch fix pass `f3a2eda`).

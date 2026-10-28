@@ -6,7 +6,7 @@ This is the riskiest ticket: logic moves out of ~1,500 lines of handler-interlea
 
 **Blocked by:** 01: Rename vendor brand to generic names
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] Core modules exist and hold all business logic; the HTTP adapters contain no business rules
 - [ ] All three existing HTTP suites pass with zero modifications
@@ -14,3 +14,7 @@ This is the riskiest ticket: logic moves out of ~1,500 lines of handler-interlea
 - [ ] The state stores (OTP, negotiation, bookings) are single-sourced — no forked copies — and reachable via the same import paths the tests use
 - [ ] `MAX_BUY` never leaves the server (load formatting and raw-record handling preserve the existing stripping behavior)
 - [ ] The dev-only raw TMS passthrough endpoint keeps working exactly as before (including its flag gating and MAX_BUY stripping)
+
+## Comments
+
+- 2026-10-29: Resolved — merged into `int/langchain-mcp-agent` at `e8d8c07` (two-axis code review passed; branch fix pass `f3a2eda`).
