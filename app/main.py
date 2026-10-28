@@ -30,6 +30,15 @@ from app.core.config import (  # noqa: F401
     TMS_TIMEOUT,
     get_test_carrier,
 )
+# State stores are the single live objects shared by every protocol;
+# re-exported so the test suites keep their original import paths.
+from app.core.state import (  # noqa: F401
+    BOOKINGS,
+    NEGOTIATION_STATE,
+    OTP_STORE,
+    otp_key,
+    prune_otp_store,
+)
 from app.core.text import (
     clean,
     equipment_to_tms,
@@ -47,43 +56,6 @@ app = FastAPI(
     title="Carrier Middleware",
     version="1.2.0",
 )
-
-# ============================================================
-# NEGOTIATION STATE
-# ============================================================
-
-NEGOTIATION_STATE = {}
-
-
-# ============================================================
-# STATE
-# ============================================================
-
-# OTP state, keyed by "<mc_number>:<run_id>" so concurrent calls
-# for the same MC never share a verification session:
-# {
-#   "code": "123456",
-#   "expires_at": datetime,
-#   "created_at": datetime,
-#   "attempts": 0,
-#   "verified": False,
-#   "resend_used": False,
-# }
-OTP_STORE = {}
-
-# Mock booking state.
-BOOKINGS = {}
-
-def otp_key(run_id, mc_number) -> str:
-    """Code sessions are per call (run_id) and per MC."""
-    return f"{clean(run_id)}:{clean(mc_number)}"
-
-
-def prune_otp_store():
-    cutoff = datetime.utcnow() - timedelta(hours=OTP_SESSION_RETENTION_HOURS)
-    for key in [k for k, v in OTP_STORE.items() if v.get("created_at", cutoff) < cutoff]:
-        OTP_STORE.pop(key, None)
-
 
 # ============================================================
 # REQUEST MODELS
