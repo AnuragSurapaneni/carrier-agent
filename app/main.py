@@ -16,7 +16,7 @@ import requests
 # ============================================================
 
 app = FastAPI(
-    title="HappyRobot Carrier Middleware",
+    title="Carrier Middleware",
     version="1.2.0",
 )
 
@@ -72,7 +72,7 @@ NEGOTIATION_LIMITS = {
     "LD00881": 2200,
 }
 
-# Test carriers used by the HappyRobot adversarial tests.
+# Test carriers used by the production voice workflow's adversarial tests.
 # These skip FMCSA and use a fixed OTP code so tests are repeatable.
 #
 # Fields:
@@ -247,7 +247,7 @@ class BookRequest(BaseModel):
     run_id: Optional[str] = None
     load_id: Optional[str] = None
     mc_number: Optional[str] = None
-    # The HappyRobot Book node sends "agreed_rate".
+    # The production voice workflow's Book node sends "agreed_rate".
     # "carrier_rate" is accepted too for backward compatibility.
     agreed_rate: Optional[str] = None
     carrier_rate: Optional[str] = None
@@ -315,7 +315,7 @@ def normalize_equipment(value: Optional[str]) -> str:
 
 def equipment_to_tms(value: Optional[str]) -> str:
     """
-    Convert HappyRobot/user wording into TMS identifiers.
+    Convert production voice workflow/user wording into TMS identifiers.
         dry van -> DRY_VAN
         reefer  -> REEFER
         flatbed -> FLATBED
@@ -601,7 +601,7 @@ def tms_get_load(load_id: str) -> Optional[dict]:
 
 @app.get("/")
 def root():
-    return {"service": "HappyRobot Carrier Middleware", "status": "ok"}
+    return {"service": "Carrier Middleware", "status": "ok"}
 
 
 @app.get("/health")
@@ -1359,7 +1359,7 @@ def book_load(
         }
 
     # ---------------------------------------------------------
-    # Deterministic HappyRobot test carrier
+    # Deterministic production voice workflow test carrier
     # ---------------------------------------------------------
     if mc_number == "9999901":
         booking_id = f"TEST-{load_id}-BOOKED"
