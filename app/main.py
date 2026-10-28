@@ -43,7 +43,7 @@ from app.core.state import (  # noqa: F401
 from app.core.tms import strip_max_buy, tms_request
 
 # ============================================================
-# CONFIGURATION
+# APPLICATION
 # ============================================================
 
 @asynccontextmanager

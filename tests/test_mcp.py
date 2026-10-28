@@ -363,13 +363,10 @@ def test_offer_evaluation_to_booking_round_trip_over_mcp():
 # client would.
 # ============================================================
 
-# The streamable-HTTP transport validates the Host header (DNS
-# rebinding protection), so the requests carry a localhost Host
-# like the production deployment.
+# Streamable-HTTP wire headers, as a real MCP client sends them.
 MCP_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
-    "Host": "127.0.0.1:8000",
 }
 
 INITIALIZE_PARAMS = {
@@ -382,14 +379,19 @@ INITIALIZE_PARAMS = {
 @pytest.fixture(scope="module")
 def asgi_client():
     """
-    One TestClient lifetime per module.
+    One TestClient lifetime per module, aimed at a localhost base
+    URL.
 
-    The MCP session manager starts in the application's lifespan and
-    can run only once per instance, as in a real process — so both
-    ASGI tests share one TestClient (one lifespan) instead of each
-    entering their own.
+    The MCP session manager starts in the application's lifespan
+    and can run only once per instance, as in a real process — so
+    all ASGI tests share one TestClient (one lifespan) instead of
+    each entering their own. The base URL stands in for the
+    production deployment (CARRIER_API_BASE on localhost): it keeps
+    the Host header inside the streamable-HTTP transport's allowed
+    hosts, and the mount's /mcp -> /mcp/ redirect stays same-host,
+    so credentials survive it exactly as they would in production.
     """
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
         yield client
 
 
@@ -469,3 +471,26 @@ def test_mcp_accepts_requests_with_the_api_key(asgi_client):
     ]
 
     assert names == EXPECTED_TOOL_NAMES
+
+
+def test_mcp_accepts_the_same_header_forms_as_the_http_surface(asgi_client):
+    # The shared key check accepts x-api-key, a raw Authorization
+    # header, and Authorization: ApiKey/Bearer — the same accepted
+    # forms as the HTTP surface. Pin one additional form here:
+    # a Bearer authorization.
+    response = asgi_client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": INITIALIZE_PARAMS,
+        },
+        headers={**MCP_HEADERS, "Authorization": f"Bearer {API_KEY}"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["mcp-session-id"]
+    assert json_rpc(response)["result"]["serverInfo"]["name"] == (
+        "Carrier Middleware"
+    )
