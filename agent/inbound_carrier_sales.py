@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Inbound Carrier Sales: local version of the HappyRobot workflow (Version 2).
+Inbound Carrier Sales: local version of the production voice workflow (Version 2).
 
 Flow: Web Call -> Carrier Sales Agent (Nico, 7 tools + hang_up)
       -> Extract Call Summary -> Save Call Summary (call_log table)
