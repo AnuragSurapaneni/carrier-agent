@@ -1323,6 +1323,15 @@ def book_load(
             "reason": "carrier_not_verified",
         }
 
+    expires_at = otp.get("expires_at")
+
+    if expires_at is None or datetime.utcnow() > expires_at:
+        return {
+            "booked": False,
+            "booking_id": None,
+            "reason": "otp_expired",
+        }
+
     # ---------------------------------------------------------
     # NEGOTIATION ACCEPTANCE CHECK
     #
@@ -1360,7 +1369,16 @@ def book_load(
     # ---------------------------------------------------------
     # Booking rate must exactly match the accepted rate.
     # ---------------------------------------------------------
-    if abs(float(accepted_rate) - carrier_rate) > 0.01:
+    try:
+        accepted_rate_value = float(accepted_rate)
+    except (ValueError, TypeError):
+        return {
+            "booked": False,
+            "booking_id": None,
+            "reason": "invalid_accepted_rate",
+        }
+
+    if abs(accepted_rate_value - carrier_rate) > 0.01:
         return {
             "booked": False,
             "booking_id": None,
