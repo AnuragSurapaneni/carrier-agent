@@ -55,7 +55,6 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import StructuredTool, tool as lc_tool
 from langchain_mcp_adapters.sessions import create_session
 from langchain_mcp_adapters.tools import load_mcp_tools
-from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, Field
 
 # --------------------------------------------------------------------------
@@ -475,7 +474,8 @@ def debug_tool_result(message):
 # --------------------------------------------------------------------------
 # Agent loop
 # --------------------------------------------------------------------------
-# Safety cap on model/tool rounds within one turn (the old loop's cap).
+# Safety cap on model turns within one caller turn, recreating the
+# old loop's cap of 8 model calls per turn.
 MAX_MODEL_ROUNDS = 8
 
 FALLBACK = (
@@ -490,41 +490,54 @@ async def agent_turn(agent, state, transcript):
     spoken while a tool runs) render as they happen. Returns the
     updated state and True when hang_up / transfer_to_rep was called
     and the call is over.
+
+    Model turns are counted in the driver loop (one per AIMessage):
+    at most MAX_MODEL_ROUNDS model invocations per caller turn. When
+    the cap is reached the cap-th call's tools still run, and if they
+    did not end the call, the fallback line is said and the call
+    ends — the old loop's safety cap, without any graph recursion
+    limit.
     """
     call_ended = False
     new_messages = []
-    try:
-        async for update in agent.astream(
-            state,
-            stream_mode="updates",
-            config={"recursion_limit": MAX_MODEL_ROUNDS * 2},
-        ):
-            for node_update in update.values():
-                for message in node_update.get("messages", []):
-                    new_messages.append(message)
-                    if isinstance(message, AIMessage):
-                        text = _spoken_text(message.content)
-                        if text:
-                            say(text)
-                            transcript.append(f"Nico: {text}")
-                        if message.tool_calls:
-                            for tc in message.tool_calls:
-                                debug("tool call:", tc["name"], redact(tc.get("args") or {}))
-                                if not text and tc["name"] in FILLERS:
-                                    say(FILLERS[tc["name"]])
-                                    transcript.append(f"Nico: {FILLERS[tc['name']]}")
-                    elif isinstance(message, ToolMessage):
-                        debug_tool_result(message)
-                        if message.name in CALL_CONTROL_TOOLS:
-                            call_ended = True
-            if call_ended:
-                # The call-control tool ended the call; stop driving the
-                # graph so the model is not asked for another turn.
-                break
-    except GraphRecursionError:
-        say(FALLBACK)
-        transcript.append(f"Nico: {FALLBACK}")
-        call_ended = True
+    model_turns = 0
+    cap_armed = False   # the cap-th model turn still had tool calls
+    async for update in agent.astream(state, stream_mode="updates"):
+        saw_tool_result = False
+        for node_update in update.values():
+            for message in node_update.get("messages", []):
+                new_messages.append(message)
+                if isinstance(message, AIMessage):
+                    model_turns += 1
+                    text = _spoken_text(message.content)
+                    if text:
+                        say(text)
+                        transcript.append(f"Nico: {text}")
+                    if message.tool_calls:
+                        for tc in message.tool_calls:
+                            debug("tool call:", tc["name"], redact(tc.get("args") or {}))
+                            if not text and tc["name"] in FILLERS:
+                                say(FILLERS[tc["name"]])
+                                transcript.append(f"Nico: {FILLERS[tc['name']]}")
+                        if model_turns >= MAX_MODEL_ROUNDS:
+                            cap_armed = True
+                elif isinstance(message, ToolMessage):
+                    saw_tool_result = True
+                    debug_tool_result(message)
+                    if message.name in CALL_CONTROL_TOOLS:
+                        call_ended = True
+        if call_ended:
+            # The call-control tool ended the call; stop driving the
+            # graph so the model is not asked for another turn.
+            break
+        if cap_armed and saw_tool_result:
+            # The cap-th model call's tools have run and did not end
+            # the call; the old loop ended the turn here instead of
+            # asking the model for another turn.
+            say(FALLBACK)
+            transcript.append(f"Nico: {FALLBACK}")
+            call_ended = True
+            break
     return {"messages": [*state["messages"], *new_messages]}, call_ended
 
 # --------------------------------------------------------------------------
