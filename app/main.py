@@ -5,7 +5,9 @@ This module is the HTTP protocol surface: Pydantic request models,
 API-key authentication, and response dicts. It contains no business
 rules — every operation is a thin pass-through to the single,
 framework-agnostic implementation in app.core, which the MCP surface
-(ticket 04) will share.
+(app.mcp_server) also calls. The same application additionally hosts
+the MCP streamable-HTTP sub-application, mounted at /mcp, so both
+protocols share one in-memory state in one process.
 
 The state stores and the API key are re-exported here as the same
 live objects from app.core, so existing import paths
@@ -13,12 +15,14 @@ live objects from app.core, so existing import paths
 and stay the single source of state.
 """
 
+from contextlib import asynccontextmanager
 from typing import Optional, Union
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from app.core import auth, booking, config, loads, negotiation, otp, verification
+from app.mcp_server import mcp, mcp_app
 
 # Configuration lives in the framework-agnostic core layer; the names
 # below are re-exported here so existing importers (and the test
@@ -39,12 +43,26 @@ from app.core.state import (  # noqa: F401
 from app.core.tms import strip_max_buy, tms_request
 
 # ============================================================
-# CONFIGURATION
+# APPLICATION
 # ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Host application lifespan.
+
+    Runs the MCP session manager for the life of the process: the
+    mounted streamable-HTTP surface has no sessions — and cannot
+    serve requests — unless its session manager is running.
+    """
+    async with mcp.session_manager.run():
+        yield
+
 
 app = FastAPI(
     title="Carrier Middleware",
     version="1.2.0",
+    lifespan=lifespan,
 )
 
 # ============================================================
@@ -254,3 +272,18 @@ def tms_raw(
         return {"ok": True, "records": records}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+# ============================================================
+# MCP SURFACE (STREAMABLE HTTP)
+#
+# The six business operations are also exposed as MCP tools over
+# the streamable-HTTP transport, mounted on this application at
+# /mcp — the MCP endpoint is CARRIER_API_BASE + /mcp. The
+# sub-application enforces the same shared API key as the HTTP
+# surface (app.mcp_server.McpApiKeyMiddleware); its session
+# manager runs in the lifespan above. Health, root, and the
+# dev-only raw TMS passthrough stay outside the MCP surface.
+# ============================================================
+
+app.mount("/mcp", mcp_app)
