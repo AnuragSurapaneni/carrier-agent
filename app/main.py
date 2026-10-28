@@ -1,32 +1,18 @@
 import hmac
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Union
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from app.core import otp, verification
+from app.core import config, loads, otp, verification
 
-# Configuration and fixtures live in the framework-agnostic core
-# layer; they are re-exported here so existing importers (and the
-# test suites) keep their original paths.
+# Configuration lives in the framework-agnostic core layer; the names
+# below are re-exported here so existing importers (and the test
+# suites) keep their original paths.
 from app.core.config import (  # noqa: F401
     API_KEY,
-    DEMO_CARRIER,
-    DEMO_CARRIER_MC,
-    ENABLE_TEST_CARRIERS,
-    ENABLE_TEST_LOADS,
-    ENABLE_TMS_RAW,
     NEGOTIATION_LIMITS,
-    OTP_MAX_ATTEMPTS,
-    OTP_SESSION_RETENTION_HOURS,
-    OTP_TTL_MINUTES,
-    TEST_LOADS,
-    TMS_AUTH,
-    TMS_HOST,
-    TMS_PORT,
-    TMS_TIMEOUT,
-    get_test_carrier,
 )
 # State stores are the single live objects shared by every protocol;
 # re-exported so the test suites keep their original import paths.
@@ -37,14 +23,8 @@ from app.core.state import (  # noqa: F401
     otp_key,
     prune_otp_store,
 )
-from app.core.text import (
-    clean,
-    equipment_to_tms,
-    format_tms_datetime,
-    split_city_state,
-    to_int,
-)
-from app.core.tms import strip_max_buy, tms_get_load, tms_request
+from app.core.text import clean
+from app.core.tms import strip_max_buy, tms_request
 
 # ============================================================
 # CONFIGURATION
@@ -198,65 +178,6 @@ def check_code(
 # SEARCH LOADS
 # ============================================================
 
-def format_load(load_id: str, orig_city, orig_state, dest_city, dest_state,
-                pickup, delivery, equipment, weight, commodity, pieces,
-                miles, dims, rate, notes) -> dict:
-    """Agent-facing load. MAX_BUY is NEVER included."""
-    lane = f"{orig_city}, {orig_state} → {dest_city}, {dest_state}"
-    if delivery:
-        dates = f"Pickup: {pickup}; Delivery: {delivery}"
-    else:
-        dates = f"Pickup: {pickup}"
-    return {
-        "load_id": load_id,
-        "lane": lane,
-        "dates": dates,
-        "equipment": equipment,
-        "weight": to_int(weight),
-        "commodity": commodity,
-        "num_of_pieces": to_int(pieces),
-        "miles": to_int(miles),
-        "dimensions": dims,
-        "posted_rate": to_int(rate),
-        "notes": notes,
-    }
-
-
-def find_test_loads(orig_city, orig_state, dest_city, dest_state,
-                    equipment, excluded) -> list[dict]:
-    if not ENABLE_TEST_LOADS:
-        return []
-
-    eq = equipment_to_tms(equipment) if equipment else ""
-    pickup = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d 08:00")
-    delivery = (datetime.utcnow() + timedelta(days=2)).strftime("%Y-%m-%d 17:00")
-
-    results = []
-    for load_id, load in TEST_LOADS.items():
-        if load_id in excluded:
-            continue
-        if orig_city and load["orig_city"].lower() != orig_city.lower():
-            continue
-        if orig_state and load["orig_state"] != orig_state:
-            continue
-        if dest_city and load["dest_city"].lower() != dest_city.lower():
-            continue
-        if dest_state and load["dest_state"] != dest_state:
-            continue
-        if eq and load["eqtype"] != eq:
-            continue
-        results.append(
-            format_load(
-                load_id, load["orig_city"], load["orig_state"],
-                load["dest_city"], load["dest_state"], pickup, delivery,
-                load["eqtype"], load["weight"], load["commodity"],
-                load["pieces"], load["miles"], load["dims"],
-                load["rate"], load["notes"],
-            )
-        )
-    return results
-
-
 @app.post("/search-loads")
 def search_loads(
     request: SearchLoadsRequest,
@@ -264,112 +185,13 @@ def search_loads(
     x_api_key: Optional[str] = Header(default=None),
 ):
     authenticate(authorization, x_api_key)
-
-    origin = clean(request.origin)
-    destination = clean(request.destination)
-    equipment = clean(request.equipment_type)
-    pickup_date = clean(request.pickup_date)
-
-    # TMS requires at least one filter.
-    if not origin and not destination and not equipment and not pickup_date:
-        return {"loads": [], "reason": "missing_search_criteria"}
-
-    query_orig_city, orig_state_filter = split_city_state(origin)
-    query_dest_city, dest_state_filter = split_city_state(destination)
-
-    excluded = {
-        item.strip()
-        for item in clean(request.exclude_load_ids).split(",")
-        if item.strip()
-    }
-
-    # Test loads first, so adversarial tests are deterministic.
-    test_matches = find_test_loads(
-        query_orig_city, orig_state_filter,
-        query_dest_city, dest_state_filter,
-        equipment, excluded,
+    return loads.search_loads(
+        request.origin,
+        request.destination,
+        request.equipment_type,
+        request.pickup_date,
+        request.exclude_load_ids,
     )
-    if test_matches:
-        print("[TEST SEARCH]", origin, equipment, [l["load_id"] for l in test_matches])
-        return {"loads": test_matches}
-
-    # --------------------------------------------------------
-    # Build LOAD_QUERY
-    #
-    # The TMS stores city and state separately, so only the
-    # city goes to the TMS. State is filtered below.
-    # --------------------------------------------------------
-
-    fields = {}
-
-    if query_orig_city:
-        fields["ORIG_CITY"] = query_orig_city
-
-    if query_dest_city:
-        fields["DEST_CITY"] = query_dest_city
-
-    if equipment:
-        fields["EQTYPE"] = equipment_to_tms(equipment)
-
-    if pickup_date:
-        fields["PICKUP_DT"] = pickup_date
-
-    fields["MAX_RESULTS"] = "5"
-
-    try:
-        records = tms_request("LOAD_QUERY", fields)
-    except Exception as exc:
-        print(f"[TMS SEARCH ERROR] {exc}")
-        return {"loads": [], "reason": "tms_error"}
-
-    loads = []
-
-    for query_record in records:
-        load_id = clean(query_record.get("load_id"))
-
-        if not load_id or load_id in excluded:
-            continue
-
-        status = clean(query_record.get("status")).upper()
-        if status and status != "OPEN":
-            continue
-
-        # Full record, with MAX_BUY already removed.
-        full_record = tms_get_load(load_id)
-        if full_record is None:
-            # Don't expose a partial record to the agent.
-            continue
-
-        def field(name: str, fallback_to_query: bool = True) -> str:
-            default = query_record.get(name) if fallback_to_query else ""
-            return clean(full_record.get(name, default))
-
-        orig_city = field("orig_city")
-        orig_state = field("orig_state")
-        dest_city = field("dest_city")
-        dest_state = field("dest_state")
-
-        # State filter: skip loads from the wrong state
-        # (e.g. Chicago Heights, IN when the caller said Illinois).
-        if orig_state_filter and orig_state and orig_state.upper() != orig_state_filter:
-            continue
-
-        if dest_state_filter and dest_state and dest_state.upper() != dest_state_filter:
-            continue
-
-        loads.append(
-            format_load(
-                load_id, orig_city, orig_state, dest_city, dest_state,
-                format_tms_datetime(field("pickup_dt")),
-                format_tms_datetime(field("delivery_dt", False)),
-                field("eqtype"), field("weight", False),
-                field("commodity", False), field("pieces", False),
-                field("miles"), field("dims", False), field("rate"),
-                field("notes", False),
-            )
-        )
-
-    return {"loads": loads}
 
 
 # ============================================================
@@ -798,7 +620,7 @@ def tms_raw(
     x_api_key: Optional[str] = Header(default=None),
 ):
     authenticate(authorization, x_api_key)
-    if not ENABLE_TMS_RAW:
+    if not config.ENABLE_TMS_RAW:
         raise HTTPException(status_code=404, detail="Not found")
 
     try:
