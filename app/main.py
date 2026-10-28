@@ -1,6 +1,5 @@
 import hmac
 import random
-import socket
 from datetime import datetime, timedelta
 from typing import Optional, Union
 
@@ -47,6 +46,7 @@ from app.core.text import (
     to_bool,
     to_int,
 )
+from app.core.tms import strip_max_buy, tms_get_load, tms_request
 
 # ============================================================
 # CONFIGURATION
@@ -138,123 +138,6 @@ def authenticate(authorization: Optional[str], x_api_key: Optional[str]):
 
     if not valid:
         raise HTTPException(status_code=401, detail="Invalid API key")
-
-
-# ============================================================
-# TMS TCP CLIENT
-# ============================================================
-
-def parse_tms_record(line: str) -> dict:
-    """
-    LOAD_ID:LD0001|ORIG_CITY:Atlanta|...
-      -> {"load_id": "LD0001", "orig_city": "Atlanta", ...}
-    """
-    record = {}
-    for part in line.split("|"):
-        if ":" not in part:
-            continue
-        key, value = part.split(":", 1)
-        record[key.strip().lower()] = value.strip()
-    return record
-
-
-def tms_request(command: str, fields: Optional[dict] = None) -> list[dict]:
-    fields = fields or {}
-
-    if not TMS_AUTH:
-        raise RuntimeError("TMS_AUTH environment variable is not configured")
-
-    # CMD must be first.
-    parts = [f"CMD:{command}", f"AUTH:{TMS_AUTH}"]
-
-    for key, value in fields.items():
-        if value is None:
-            continue
-        # Protocol does not permit these characters.
-        value = str(value).replace("|", "").replace("\r", "").replace("\n", "")
-        parts.append(f"{key}:{value}")
-
-    message = "|".join(parts) + "\r\n"
-
-    # Avoid logging request fields, which may contain carrier or rate data.
-    print("[TMS REQUEST]", command)
-
-    response_lines = []
-
-    try:
-        with socket.create_connection((TMS_HOST, TMS_PORT), timeout=TMS_TIMEOUT) as sock:
-            sock.sendall(message.encode("ascii", errors="ignore"))
-
-            buffer = b""
-            done = False
-
-            while not done:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                buffer += chunk
-
-                while b"\r\n" in buffer:
-                    raw_line, buffer = buffer.split(b"\r\n", 1)
-                    line = raw_line.decode("ascii", errors="ignore").strip()
-                    if not line:
-                        continue
-                    response_lines.append(line)
-                    if line == "END":
-                        done = True
-                        break
-
-    except socket.timeout:
-        raise RuntimeError("TMS connection timed out")
-    except OSError as exc:
-        raise RuntimeError(f"TMS connection failed: {exc}")
-
-    # LOAD_QUERY can legitimately return nothing.
-    if not response_lines:
-        if command == "LOAD_QUERY":
-            print("[TMS RESPONSE] No matching loads")
-            return []
-        raise RuntimeError("TMS returned an empty response")
-
-    if response_lines[0].startswith("ERR|"):
-        error = parse_tms_record(response_lines[0])
-        raise RuntimeError(
-            f"TMS {error.get('code', 'UNKNOWN')}: {error.get('msg', 'TMS error')}"
-        )
-
-    records = []
-    for line in response_lines:
-        if line == "END":
-            break
-        records.append(parse_tms_record(line))
-
-    return records
-
-
-def tms_get_load_raw(load_id: str) -> Optional[dict]:
-    """Full LOAD_GET record, including internal fields. Internal use only."""
-    load_id = clean(load_id)
-    if not load_id:
-        return None
-    try:
-        records = tms_request("LOAD_GET", {"LOAD_ID": load_id})
-    except Exception as exc:
-        print(f"[TMS LOAD_GET ERROR] {exc}")
-        return None
-    return records[0] if records else None
-
-
-def tms_get_load(load_id: str) -> Optional[dict]:
-    """
-    Load record safe to build agent-facing output from.
-    MAX_BUY is removed and is NEVER returned to the agent.
-    """
-    record = tms_get_load_raw(load_id)
-    if record is None:
-        return None
-    record = dict(record)
-    record.pop("max_buy", None)
-    return record
 
 
 # ============================================================
@@ -1136,8 +1019,7 @@ def tms_raw(
     try:
         records = tms_request(request.command, request.fields)
         # Never leak MAX_BUY, even from the debug endpoint.
-        for record in records:
-            record.pop("max_buy", None)
+        strip_max_buy(records)
         return {"ok": True, "records": records}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
