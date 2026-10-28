@@ -23,6 +23,11 @@ every MCP tool call (the LLM never sees or provides it), so the
 middleware's session-scoped state (OTP, negotiation) behaves
 identically to the old HTTP agent.
 
+The post-call summary is extracted from the transcript as a Pydantic
+CallSummary via LangChain structured output (with_structured_output
+on EXTRACT_MODEL at temperature 0) and written to the existing
+call_log table with its unchanged schema.
+
 Manual smoke run (a real OPENAI_API_KEY is required):
 
     Middleware: ENABLE_TEST_CARRIERS=true ENABLE_TEST_LOADS=true
@@ -42,15 +47,16 @@ import sqlite3
 import sys
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool, tool as lc_tool
 from langchain_mcp_adapters.sessions import create_session
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.errors import GraphRecursionError
-from openai import OpenAI
+from pydantic import BaseModel, Field
 
 # --------------------------------------------------------------------------
 # Config
@@ -526,46 +532,85 @@ async def agent_turn(agent, state, transcript):
 # --------------------------------------------------------------------------
 EXTRACT_PROMPT = (
     "You are reviewing a finished inbound carrier sales call between an AI rep and a truck carrier. "
-    "Extract the fields below from the transcript. Only use what actually happened in the call. "
-    "If a value never came up, return an empty string. For outcome, pick the single value that best "
-    "describes how the call ended.\n\n"
-    "Return a JSON object with exactly these keys:\n"
-    "- mc_number: Carrier MC number, digits only. Empty if never given.\n"
-    "- outcome: Exactly one of: booked, fmcsa_failed, otp_failed, otp_no_phone, negotiation_failed, "
-    "no_load, load_declined, tms_error, caller_hung_up, other.\n"
-    "- sentiment: Carrier's overall sentiment. Exactly one of: positive, neutral, negative.\n"
-    "- load_id: load_id of the load that was booked or last negotiated. Empty if none.\n"
-    "- agreed_rate: Final agreed dollar rate, number only, only if a rate was accepted. Empty otherwise.\n"
-    "- language: Main language of the call: en or es.\n"
-    "- notes: One or two sentences a rep would find useful. Never include verification codes."
+    "Extract the fields from the transcript. Only use what actually happened in the call. "
+    "If a value never came up, return an empty string."
 )
 
-def extract_summary(client, transcript_text):
-    # The raw-JSON extraction stays as-is for now; a later ticket moves
-    # it to LangChain structured output (with_structured_output).
-    resp = client.chat.completions.create(
-        model=EXTRACT_MODEL,
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": EXTRACT_PROMPT},
-                  {"role": "user", "content": transcript_text}],
-        temperature=0)
-    try:
-        return json.loads(resp.choices[0].message.content)
-    except (json.JSONDecodeError, TypeError):
-        return {}
+class CallSummary(BaseModel):
+    """
+    Post-call summary of one inbound carrier sales call.
+
+    The field descriptions carry the per-field extraction guidance
+    (they become part of the structured-output schema the model
+    sees), and the empty-string defaults cover values that never
+    came up.
+    """
+    mc_number: str = Field(
+        default="",
+        description="Carrier MC number, digits only. Empty if never given.")
+    outcome: Literal[
+        "booked", "fmcsa_failed", "otp_failed", "otp_no_phone",
+        "negotiation_failed", "no_load", "load_declined", "tms_error",
+        "caller_hung_up", "other",
+    ] = Field(
+        default="other",
+        description="Exactly one of: booked, fmcsa_failed, otp_failed, otp_no_phone, "
+                    "negotiation_failed, no_load, load_declined, tms_error, caller_hung_up, other. "
+                    "Pick the single value that best describes how the call ended.")
+    sentiment: Literal["positive", "neutral", "negative"] = Field(
+        default="neutral",
+        description="Carrier's overall sentiment. Exactly one of: positive, neutral, negative.")
+    load_id: str = Field(
+        default="",
+        description="load_id of the load that was booked or last negotiated. Empty if none.")
+    agreed_rate: str | int | float = Field(
+        default="",
+        description="Final agreed dollar rate, number only, only if a rate was accepted. Empty otherwise.")
+    language: str = Field(
+        default="",
+        description="Main language of the call: en or es.")
+    notes: str = Field(
+        default="",
+        description="One or two sentences a rep would find useful. Never include verification codes.")
+
+def extract_summary(transcript_text, model=None):
+    """
+    Extract the CallSummary from the finished call's transcript with
+    LangChain structured output: a chat model bound with
+    with_structured_output(CallSummary), so the summary schema is
+    type-checked instead of a raw json_object response parsed by hand.
+
+    `model` is an optional injected chat model — the spec's single
+    micro-seam, a function parameter rather than an architectural
+    seam — so tests can supply a fake that returns a fixed
+    CallSummary. When omitted, the model is built
+    provider-agnostically from EXTRACT_MODEL at temperature 0, the
+    same way the agent builds AGENT_MODEL.
+    """
+    if model is None:
+        model = init_chat_model(EXTRACT_MODEL, temperature=0)
+    return model.with_structured_output(CallSummary).invoke(
+        [SystemMessage(content=EXTRACT_PROMPT),
+         HumanMessage(content=transcript_text)]
+    )
 
 def save_summary(run_id, s):
+    """
+    Save a CallSummary to the existing call_log table. The schema and
+    the row shape are unchanged from the hand-parsed JSON era, so
+    downstream review workflows are unaffected.
+    """
     con = sqlite3.connect(DB_PATH)
     con.execute("""CREATE TABLE IF NOT EXISTS call_log (
         run_id TEXT PRIMARY KEY, mc_number TEXT, outcome TEXT, sentiment TEXT,
         load_id TEXT, agreed_rate REAL, language TEXT, notes TEXT, created_at TEXT)""")
     try:
-        rate = float(str(s.get("agreed_rate", "")).replace("$", "").replace(",", "")) if s.get("agreed_rate") not in ("", None) else None
+        rate = float(str(s.agreed_rate).replace("$", "").replace(",", "")) if s.agreed_rate not in ("", None) else None
     except ValueError:
         rate = None
     con.execute("INSERT OR REPLACE INTO call_log VALUES (?,?,?,?,?,?,?,?,?)", (
-        run_id, s.get("mc_number", ""), s.get("outcome", ""), s.get("sentiment", ""),
-        s.get("load_id", ""), rate, s.get("language", ""), s.get("notes", ""),
+        run_id, s.mc_number, s.outcome, s.sentiment,
+        s.load_id, rate, s.language, s.notes,
         datetime.datetime.now().isoformat(timespec="seconds")))
     con.commit()
     con.close()
@@ -631,20 +676,18 @@ def main():
     parser.add_argument("--debug", action="store_true", help="print tool calls and API responses")
     DEBUG = parser.parse_args().debug
 
-    # The post-call summary extraction still uses the raw OpenAI client
-    # and raw JSON; a later ticket moves it to LangChain structured
-    # output.
-    client = OpenAI()
     run_id = str(uuid.uuid4())
 
     transcript, caller_hung_up = asyncio.run(run_call(run_id))
 
     print("--- Call ended" + (" (caller hung up)" if caller_hung_up else "") + " ---")
 
-    summary = extract_summary(client, "\n".join(transcript))
+    # Post-call: extract the summary with LangChain structured output
+    # (EXTRACT_MODEL at temperature 0) and save it to the call log.
+    summary = extract_summary("\n".join(transcript))
     save_summary(run_id, summary)
     print("Call summary saved to", DB_PATH)
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print(json.dumps(summary.model_dump(), indent=2, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()
