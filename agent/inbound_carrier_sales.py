@@ -6,8 +6,35 @@ Flow: Web Call -> Carrier Sales Agent (Nico, 7 tools + hang_up)
       -> Extract Call Summary -> Save Call Summary (call_log table)
 
 Text-only: you type as the carrier in the terminal.
+
+Rebuilt on LangChain over MCP: the agent is built with the canonical
+agent API (create_agent + init_chat_model from AGENT_MODEL,
+temperature 0.3) and talks to the system of record exclusively
+through MCP tool calls. The six middleware tools are loaded from the
+middleware's MCP server with the standard LangChain-MCP adapter
+(load_mcp_tools) over streamable HTTP at CARRIER_API_BASE + /mcp,
+with CARRIER_API_KEY sent as a static x-api-key header. hang_up and
+transfer_to_rep remain agent-local, instant tools. One MCP session is
+opened for the life of the call (one REPL process = one call) and
+closed cleanly on exit, including on hang-up and on transfer.
+
+The per-call run id is generated here and injected by the agent into
+every MCP tool call (the LLM never sees or provides it), so the
+middleware's session-scoped state (OTP, negotiation) behaves
+identically to the old HTTP agent.
+
+Manual smoke run (a real OPENAI_API_KEY is required):
+
+    Middleware: ENABLE_TEST_CARRIERS=true ENABLE_TEST_LOADS=true
+                MIDDLEWARE_API_KEY=<k> uvicorn app.main:app --port 8000
+    Agent:      OPENAI_API_KEY=<key> CARRIER_API_KEY=<k>
+                sh agent/setup.sh
+    Drive:      MC 9999901 -> code 424242 -> origin Chicago + dry van
+                -> accept a rate -> book -> transfer
 """
 import argparse
+import asyncio
+import copy
 import datetime
 import json
 import os
@@ -16,7 +43,13 @@ import sys
 import uuid
 from pathlib import Path
 
-import requests
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import StructuredTool, tool as lc_tool
+from langchain_mcp_adapters.sessions import create_session
+from langchain_mcp_adapters.tools import load_mcp_tools
+from langgraph.errors import GraphRecursionError
 from openai import OpenAI
 
 # --------------------------------------------------------------------------
@@ -29,16 +62,6 @@ EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "gpt-4o-mini")
 DB_PATH = os.getenv(
     "CALL_LOG_DB", str(Path(__file__).resolve().with_name("call_log.db"))
 )
-
-# The workflow sends every value as a JSON *string* ("5126", "true", "1").
-# Keep True to reproduce the workflow exactly; set False to send real numbers/booleans.
-MATCH_WORKFLOW_STRINGS = True
-
-HEADERS = {
-    "Content-Type": "application/json",
-    "x-api-key": API_KEY,
-    "ngrok-skip-browser-warning": "true",
-}
 
 INITIAL_MESSAGE = "Hey, this is Nico with carrier sales. What's your MC number?"
 
@@ -240,7 +263,14 @@ Use only this date, never invent one: {{TODAY}}
 """
 
 # --------------------------------------------------------------------------
-# Tool definitions (descriptions copied from the workflow's tool nodes)
+# Reference tool definitions (descriptions copied from the workflow's
+# tool nodes)
+#
+# The agent no longer dispatches through this list: its middleware
+# tools arrive from the MCP server. It survives as the frozen
+# reference contract for tool identity — the MCP server's tool names,
+# descriptions, and parameter shapes must match it, and
+# tests/test_mcp.py pins exactly that.
 # --------------------------------------------------------------------------
 def _fn(name, description, properties=None, required=None):
     return {
@@ -304,21 +334,73 @@ FILLERS = {
     "book_load": "One sec, locking that in.",
 }
 
-# Tool name -> (endpoint path, function building the request body). Same bodies as the workflow.
-ENDPOINTS = {
-    "verify_carrier": ("/verify", lambda a: {"mc_number": a.get("mc_number")}),
-    "send_verification_code": ("/send-code", lambda a: {"mc_number": a.get("mc_number"), "is_resend": a.get("is_resend", False)}),
-    "check_verification_code": ("/check-code", lambda a: {"mc_number": a.get("mc_number"), "code": a.get("code")}),
-    "search_loads": ("/search-loads", lambda a: {
-        "origin": a.get("origin"), "equipment_type": a.get("equipment_type"),
-        "destination": a.get("destination", ""), "pickup_date": a.get("pickup_date", ""),
-        "exclude_load_ids": a.get("exclude_load_ids", "")}),
-    "evaluate_offer": ("/evaluate-offer", lambda a: {
-        "load_id": a.get("load_id"), "carrier_rate": a.get("carrier_rate"), "round": a.get("round")}),
-    # Note: the workflow sends agreed_rate under the key "carrier_rate".
-    "book_load": ("/book", lambda a: {
-        "load_id": a.get("load_id"), "mc_number": a.get("mc_number"), "carrier_rate": a.get("agreed_rate")}),
-}
+# --------------------------------------------------------------------------
+# Call control: agent-local tools. Ending or escalating the call is
+# instant and never a middleware round trip.
+# --------------------------------------------------------------------------
+@lc_tool
+def hang_up() -> dict:
+    """End the call. Call in the same turn as the single closing line."""
+    return {"ok": True}
+
+
+@lc_tool
+def transfer_to_rep() -> dict:
+    """Call only after book_load returns booked true. Mock transfer to a senior rep who will send the rate confirmation. After this, end the call."""
+    return {"transferred": True}
+
+
+CALL_CONTROL_TOOLS = ("hang_up", "transfer_to_rep")
+
+# --------------------------------------------------------------------------
+# MCP: streamable-HTTP connection to the middleware + run_id injection
+# --------------------------------------------------------------------------
+def mcp_connection():
+    """
+    The adapter connection config for the middleware's MCP server.
+
+    CARRIER_API_KEY doubles as the MCP credential and is sent as a
+    static header on every request; CARRIER_API_BASE is the
+    middleware's base URL and the MCP endpoint lives at /mcp.
+    """
+    return {
+        "transport": "streamable_http",
+        "url": f"{BASE_URL}/mcp",
+        "headers": {"x-api-key": API_KEY},
+    }
+
+def _bind_run_id(mcp_tool, run_id):
+    """
+    Wrap an MCP-loaded tool so every call carries this call's run id.
+
+    The middleware keys its session-scoped state (OTP, negotiation)
+    on run_id, exactly as over HTTP. The LLM never sees run_id: it is
+    stripped from the argument schema and set by the agent on every
+    call — the same role the old call_endpoint played.
+    """
+    schema = copy.deepcopy(mcp_tool.args_schema)
+    schema.get("properties", {}).pop("run_id", None)
+    if "required" in schema:
+        schema["required"] = [p for p in schema["required"] if p != "run_id"]
+
+    async def call_with_run_id(**arguments):
+        debug("MCP call:", mcp_tool.name, redact({**arguments, "run_id": run_id}))
+        try:
+            return await mcp_tool.ainvoke({**arguments, "run_id": run_id})
+        except Exception as e:
+            # A transport/session failure (middleware down, session
+            # dropped): surface it the way the old HTTP agent did, so
+            # the model can retry once or end the call with the
+            # failure closing line.
+            debug("MCP call failed:", repr(e))
+            return {"error": f"request failed: {e}"}
+
+    return StructuredTool(
+        name=mcp_tool.name,
+        description=mcp_tool.description,
+        args_schema=schema,
+        coroutine=call_with_run_id,
+    )
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -353,90 +435,91 @@ def say(text):
     # Pause tokens are for the voice engine; show them as a short pause in the terminal.
     print(f"Nico: {text.replace('<|pause_short|>', '…')}")
 
-def to_wire(value):
-    """Match how the workflow renders values into its JSON body templates."""
-    if not MATCH_WORKFLOW_STRINGS:
-        return value
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    return str(value)
+def _spoken_text(content):
+    """The model's spoken text; content may be a string or content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return "" if content is None else str(content)
 
-def call_endpoint(path, body, run_id):
-    payload = {"run_id": run_id, **{k: to_wire(v) for k, v in body.items()}}
-    debug("POST", path, json.dumps(redact(payload)))
+def _tool_result_text(message):
+    """A tool result's text (a ToolMessage's content may be content blocks)."""
+    content = message.content
+    if isinstance(content, list):
+        return " ".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return content if content is not None else ""
+
+def debug_tool_result(message):
+    """Print a tool result in the old call_endpoint "<-" debug shape."""
+    text = _tool_result_text(message)
     try:
-        r = requests.post(BASE_URL + path, json=payload, headers=HEADERS, timeout=20)
-    except requests.RequestException as e:
-        return {"error": f"request failed: {e}"}
-    if r.status_code >= 500:  # workflow has ignore5XX = false
-        return {"error": f"HTTP {r.status_code}"}
-    try:
-        data = r.json()
+        debug("<-", json.dumps(redact(json.loads(text)), ensure_ascii=False))
     except ValueError:
-        return {"error": f"non-JSON response (HTTP {r.status_code})"}
-    debug("<-", json.dumps(redact(data)))
-    return data
-
-def execute_tool(name, args, run_id):
-    if name == "hang_up":
-        return {"ok": True}
-    if name == "transfer_to_rep":
-        return {"transferred": True}  # mock transfer, same as the workflow
-    if name in ENDPOINTS:
-        path, build = ENDPOINTS[name]
-        return call_endpoint(path, build(args), run_id)
-    return {"error": f"unknown tool {name}"}
+        debug("<-", text)
 
 # --------------------------------------------------------------------------
 # Agent loop
 # --------------------------------------------------------------------------
-def agent_turn(client, messages, transcript, run_id):
-    """Run the model until it stops calling tools. Returns True if the call ended."""
-    for _ in range(8):  # safety cap on tool loops within one turn
-        resp = client.chat.completions.create(
-            model=AGENT_MODEL, messages=messages, tools=TOOLS, temperature=0.3)
-        msg = resp.choices[0].message
+# Safety cap on model/tool rounds within one turn (the old loop's cap).
+MAX_MODEL_ROUNDS = 8
 
-        entry = {"role": "assistant", "content": msg.content or ""}
-        if msg.tool_calls:
-            entry["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
-        messages.append(entry)
+FALLBACK = (
+    "Sorry about that, I couldn't lock it in on my end. A rep will call you back shortly."
+)
 
-        if msg.content:
-            say(msg.content)
-            transcript.append(f"Nico: {msg.content}")
+async def agent_turn(agent, state, transcript):
+    """
+    Run one caller turn until the model stops calling tools.
 
-        if not msg.tool_calls:
-            return False
-
-        call_ended = False
-        for tc in msg.tool_calls:
-            name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            debug("tool call:", name, redact(args))
-            if name in FILLERS and not msg.content:
-                say(FILLERS[name])
-                transcript.append(f"Nico: {FILLERS[name]}")
-            result = execute_tool(name, args, run_id)
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
-            if name in ("hang_up", "transfer_to_rep"):
-                call_ended = True
-
-        if call_ended:
-            # Locally, hang_up/transfer really end the call: no more turns.
-            return True
-
-    fallback = "Sorry about that, I couldn't lock it in on my end. A rep will call you back shortly."
-    say(fallback)
-    transcript.append(f"Nico: {fallback}")
-    return True
+    Streams the agent's node updates so Nico's lines (and the fillers
+    spoken while a tool runs) render as they happen. Returns the
+    updated state and True when hang_up / transfer_to_rep was called
+    and the call is over.
+    """
+    call_ended = False
+    new_messages = []
+    try:
+        async for update in agent.astream(
+            state,
+            stream_mode="updates",
+            config={"recursion_limit": MAX_MODEL_ROUNDS * 2},
+        ):
+            for node_update in update.values():
+                for message in node_update.get("messages", []):
+                    new_messages.append(message)
+                    if isinstance(message, AIMessage):
+                        text = _spoken_text(message.content)
+                        if text:
+                            say(text)
+                            transcript.append(f"Nico: {text}")
+                        if message.tool_calls:
+                            for tc in message.tool_calls:
+                                debug("tool call:", tc["name"], redact(tc.get("args") or {}))
+                                if not text and tc["name"] in FILLERS:
+                                    say(FILLERS[tc["name"]])
+                                    transcript.append(f"Nico: {FILLERS[tc['name']]}")
+                    elif isinstance(message, ToolMessage):
+                        debug_tool_result(message)
+                        if message.name in CALL_CONTROL_TOOLS:
+                            call_ended = True
+            if call_ended:
+                # The call-control tool ended the call; stop driving the
+                # graph so the model is not asked for another turn.
+                break
+    except GraphRecursionError:
+        say(FALLBACK)
+        transcript.append(f"Nico: {FALLBACK}")
+        call_ended = True
+    return {"messages": [*state["messages"], *new_messages]}, call_ended
 
 # --------------------------------------------------------------------------
 # Post-call: Extract Call Summary + Save Call Summary
@@ -458,6 +541,8 @@ EXTRACT_PROMPT = (
 )
 
 def extract_summary(client, transcript_text):
+    # The raw-JSON extraction stays as-is for now; a later ticket moves
+    # it to LangChain structured output (with_structured_output).
     resp = client.chat.completions.create(
         model=EXTRACT_MODEL,
         response_format={"type": "json_object"},
@@ -488,40 +573,71 @@ def save_summary(run_id, s):
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+async def run_call(run_id):
+    """
+    One process is one call: open one MCP session for the life of the
+    call, run the REPL, close the session. The session is closed
+    cleanly on every exit path — /quit, hang_up, transfer_to_rep,
+    Ctrl+C/EOF.
+    """
+    async with create_session(mcp_connection()) as session:
+        try:
+            await session.initialize()
+            mcp_tools = await load_mcp_tools(session)
+        except Exception as e:
+            print(f"Could not reach the middleware's MCP server at {BASE_URL}/mcp: {e}")
+            sys.exit(1)
+
+        model = init_chat_model(AGENT_MODEL, temperature=0.3)
+        agent = create_agent(
+            model,
+            [_bind_run_id(mcp_tool, run_id) for mcp_tool in mcp_tools]
+            + [transfer_to_rep, hang_up],
+            system_prompt=SYSTEM_PROMPT.replace(
+                "{{TODAY}}", datetime.date.today().isoformat()
+            ),
+        )
+
+        state = {"messages": [AIMessage(content=INITIAL_MESSAGE)]}
+        transcript = [f"Nico: {INITIAL_MESSAGE}"]
+
+        print(f"--- Inbound Carrier Sales | run {run_id} | type /quit to hang up ---")
+        say(INITIAL_MESSAGE)
+
+        caller_hung_up = False
+        while True:
+            try:
+                user = input("You:  ").strip()
+            except (EOFError, KeyboardInterrupt):
+                user = "/quit"
+            if user == "/quit":
+                caller_hung_up = True
+                break
+            if not user:
+                continue
+            transcript.append(f"Carrier: {user}")
+            state, call_ended = await agent_turn(
+                agent,
+                {"messages": [*state["messages"], HumanMessage(content=user)]},
+                transcript,
+            )
+            if call_ended:
+                break
+    return transcript, caller_hung_up
+
 def main():
     global DEBUG
     parser = argparse.ArgumentParser(description="Inbound Carrier Sales (local)")
     parser.add_argument("--debug", action="store_true", help="print tool calls and API responses")
     DEBUG = parser.parse_args().debug
 
+    # The post-call summary extraction still uses the raw OpenAI client
+    # and raw JSON; a later ticket moves it to LangChain structured
+    # output.
     client = OpenAI()
     run_id = str(uuid.uuid4())
-    today = datetime.date.today().isoformat()
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT.replace("{{TODAY}}", today)},
-        {"role": "assistant", "content": INITIAL_MESSAGE},
-    ]
-    transcript = [f"Nico: {INITIAL_MESSAGE}"]
-
-    print(f"--- Inbound Carrier Sales | run {run_id} | type /quit to hang up ---")
-    say(INITIAL_MESSAGE)
-
-    caller_hung_up = False
-    while True:
-        try:
-            user = input("You:  ").strip()
-        except (EOFError, KeyboardInterrupt):
-            user = "/quit"
-        if user == "/quit":
-            caller_hung_up = True
-            break
-        if not user:
-            continue
-        messages.append({"role": "user", "content": user})
-        transcript.append(f"Carrier: {user}")
-        if agent_turn(client, messages, transcript, run_id):
-            break
+    transcript, caller_hung_up = asyncio.run(run_call(run_id))
 
     print("--- Call ended" + (" (caller hung up)" if caller_hung_up else "") + " ---")
 
