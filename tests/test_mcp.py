@@ -15,6 +15,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 
+import pytest
 from fastapi.testclient import TestClient
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import LATEST_PROTOCOL_VERSION
@@ -350,3 +351,121 @@ def test_offer_evaluation_to_booking_round_trip_over_mcp():
         "booking_id": f"TEST-{CHI_REEFER}-BOOKED",
         "reason": "booked",
     }
+
+
+# ============================================================
+# AUTH: at the ASGI transport the middleware actually protects
+#
+# The in-memory transport above bypasses the ASGI mount (and with
+# it the API-key middleware), so the auth assertions are exercised
+# here against the mounted application, speaking the streamable-
+# HTTP wire protocol (JSON-RPC over HTTP) the way a real MCP
+# client would.
+# ============================================================
+
+# The streamable-HTTP transport validates the Host header (DNS
+# rebinding protection), so the requests carry a localhost Host
+# like the production deployment.
+MCP_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    "Host": "127.0.0.1:8000",
+}
+
+INITIALIZE_PARAMS = {
+    "protocolVersion": LATEST_PROTOCOL_VERSION,
+    "capabilities": {},
+    "clientInfo": {"name": "pytest-asgi-client", "version": "0.0.0"},
+}
+
+
+@pytest.fixture(scope="module")
+def asgi_client():
+    """
+    One TestClient lifetime per module.
+
+    The MCP session manager starts in the application's lifespan and
+    can run only once per instance, as in a real process — so both
+    ASGI tests share one TestClient (one lifespan) instead of each
+    entering their own.
+    """
+    with TestClient(app) as client:
+        yield client
+
+
+def post_mcp(client, payload, session_id=None, api_key=None):
+    headers = dict(MCP_HEADERS)
+    if session_id is not None:
+        headers["mcp-session-id"] = session_id
+    if api_key is not None:
+        headers["x-api-key"] = api_key
+    return client.post("/mcp", json=payload, headers=headers)
+
+
+def json_rpc(response):
+    """Extract the JSON-RPC message from a JSON or SSE response body."""
+    if response.headers.get("content-type", "").startswith("application/json"):
+        return response.json()
+    messages = [
+        json.loads(line.removeprefix("data:").strip())
+        for line in response.text.splitlines()
+        if line.startswith("data:")
+    ]
+    assert messages, f"no JSON-RPC message in response: {response.text!r}"
+    return messages[-1]
+
+
+def test_mcp_rejects_requests_without_a_valid_api_key(asgi_client):
+    response = post_mcp(
+        asgi_client,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": INITIALIZE_PARAMS,
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid API key"}
+
+
+def test_mcp_accepts_requests_with_the_api_key(asgi_client):
+    response = post_mcp(
+        asgi_client,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": INITIALIZE_PARAMS,
+        },
+        api_key=API_KEY,
+    )
+
+    assert response.status_code == 200
+    session_id = response.headers["mcp-session-id"]
+    result = json_rpc(response)["result"]
+    assert result["serverInfo"]["name"] == "Carrier Middleware"
+
+    # Complete the handshake, then list the tools over the same
+    # protected transport.
+    post_mcp(
+        asgi_client,
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        session_id=session_id,
+        api_key=API_KEY,
+    )
+
+    tools_response = post_mcp(
+        asgi_client,
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        session_id=session_id,
+        api_key=API_KEY,
+    )
+
+    assert tools_response.status_code == 200
+    names = [
+        tool["name"] for tool in json_rpc(tools_response)["result"]["tools"]
+    ]
+
+    assert names == EXPECTED_TOOL_NAMES
