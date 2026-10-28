@@ -134,8 +134,7 @@ def get_test_carrier(mc_number: str) -> Optional[dict]:
 # TEST LOADS (only served when ENABLE_TEST_LOADS=true)
 # ============================================================
 #
-# One open load per adversarial-test lane. "max_buy" is the hidden
-# ceiling used by /evaluate-offer and is NEVER returned to the agent.
+# One open load per adversarial-test lane.
 
 TEST_LOADS = {
     "TEST-CHI-REEFER": {
@@ -143,43 +142,37 @@ TEST_LOADS = {
         "dest_city": "Atlanta", "dest_state": "GA",
         "eqtype": "REEFER", "weight": 38000, "commodity": "Frozen food",
         "pieces": 20, "miles": 716, "dims": "", "notes": "Keep at minus ten F",
-        "rate": 2400, "max_buy": 2700,
+        "rate": 2400,
     },
     "TEST-HOU-FLATBED": {
         "orig_city": "Houston", "orig_state": "TX",
         "dest_city": "Denver", "dest_state": "CO",
         "eqtype": "FLATBED", "weight": 44000, "commodity": "Steel coils",
         "pieces": 6, "miles": 1030, "dims": "", "notes": "Tarps required",
-        "rate": 2200, "max_buy": 2500,
+        "rate": 2200,
     },
     "TEST-LRD-DRYVAN": {
         "orig_city": "Laredo", "orig_state": "TX",
         "dest_city": "Dallas", "dest_state": "TX",
         "eqtype": "DRY_VAN", "weight": 32000, "commodity": "Auto parts",
         "pieces": 24, "miles": 430, "dims": "", "notes": "",
-        "rate": 1100, "max_buy": 1400,
+        "rate": 1100,
     },
     "TEST-ATL-DRYVAN": {
         "orig_city": "Atlanta", "orig_state": "GA",
         "dest_city": "Charlotte", "dest_state": "NC",
         "eqtype": "DRY_VAN", "weight": 28000, "commodity": "Paper goods",
         "pieces": 18, "miles": 245, "dims": "", "notes": "",
-        "rate": 950, "max_buy": 1150,
+        "rate": 950,
     },
     "TEST-DAL-DRYVAN": {
         "orig_city": "Dallas", "orig_state": "TX",
         "dest_city": "Memphis", "dest_state": "TN",
         "eqtype": "DRY_VAN", "weight": 30000, "commodity": "Consumer goods",
         "pieces": 22, "miles": 452, "dims": "", "notes": "",
-        "rate": 1300, "max_buy": 1550,
+        "rate": 1300,
     },
 }
-
-
-def get_test_load(load_id: str) -> Optional[dict]:
-    if not ENABLE_TEST_LOADS:
-        return None
-    return TEST_LOADS.get(load_id)
 
 
 # ============================================================
@@ -382,7 +375,7 @@ US_STATES = {
     "new jersey": "nj",
     "new mexico": "nm",
     "new york": "ny",
-    "nueva york": "NY",
+    "nueva york": "ny",
     "north carolina": "nc",
     "north dakota": "nd",
     "ohio": "oh",
@@ -602,17 +595,6 @@ def tms_get_load(load_id: str) -> Optional[dict]:
     return record
 
 
-def tms_get_max_buy(load_id: str) -> Optional[float]:
-    """Internal only. Never return this value to the agent."""
-    record = tms_get_load_raw(load_id)
-    if record is None:
-        return None
-    try:
-        return float(record.get("max_buy", ""))
-    except (ValueError, TypeError):
-        return None
-
-
 # ============================================================
 # HEALTH
 # ============================================================
@@ -798,8 +780,6 @@ def send_code(
             "masked_destination": None,
             "reason": "carrier_not_verified",
         }
-
-    key = otp_key(mc_number, run_id)
 
     # Resend rules: one resend per call.
     existing = OTP_STORE.get(otp_key(run_id, mc_number))
@@ -1060,26 +1040,6 @@ def search_loads(
         )
 
     return {"loads": loads}
-
-
-# ============================================================
-# EVALUATE OFFER
-# ============================================================
-
-DEMO_LOAD_CEILINGS = {
-    "1001": 2500,
-    "LD0000045821": 2500,
-}
-
-
-def get_max_rate(load_id: str) -> Optional[float]:
-    """Hidden ceiling. Internal only; NEVER returned to the agent."""
-    test_load = get_test_load(load_id)
-    if test_load:
-        return float(test_load["max_buy"])
-    if load_id in DEMO_LOAD_CEILINGS:
-        return float(DEMO_LOAD_CEILINGS[load_id])
-    return tms_get_max_buy(load_id)
 
 
 # ============================================================
