@@ -1,11 +1,24 @@
-import hmac
-from datetime import datetime
+"""
+HTTP adapter for the Carrier Middleware system of record.
+
+This module is the HTTP protocol surface: Pydantic request models,
+API-key authentication, and response dicts. It contains no business
+rules — every operation is a thin pass-through to the single,
+framework-agnostic implementation in app.core, which the MCP surface
+(ticket 04) will share.
+
+The state stores and the API key are re-exported here as the same
+live objects from app.core, so existing import paths
+(app.main.OTP_STORE, app.main.NEGOTIATION_STATE, ...) keep working
+and stay the single source of state.
+"""
+
 from typing import Optional, Union
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from app.core import booking, config, loads, negotiation, otp, verification
+from app.core import auth, booking, config, loads, negotiation, otp, verification
 
 # Configuration lives in the framework-agnostic core layer; the names
 # below are re-exported here so existing importers (and the test
@@ -23,7 +36,6 @@ from app.core.state import (  # noqa: F401
     otp_key,
     prune_otp_store,
 )
-from app.core.text import clean
 from app.core.tms import strip_max_buy, tms_request
 
 # ============================================================
@@ -87,34 +99,18 @@ class BookRequest(BaseModel):
 # AUTHENTICATION
 # ============================================================
 
-def api_key_matches(value: str) -> bool:
-    return hmac.compare_digest(value.encode("utf-8"), API_KEY.encode("utf-8"))
-
-
 def authenticate(authorization: Optional[str], x_api_key: Optional[str]):
     """
-    Accept any of:
+    Reject the request unless a valid API key is presented.
+
+    Delegates to app.core.auth — the same check every protocol
+    surface runs — which accepts:
         x-api-key: <configured key>
         Authorization: <configured key>
         Authorization: ApiKey <configured key>
         Authorization: Bearer <configured key>
     """
-    valid = False
-
-    if x_api_key and api_key_matches(x_api_key):
-        valid = True
-
-    if authorization:
-        auth = authorization.strip()
-        if api_key_matches(auth):
-            valid = True
-        lowered = auth.lower()
-        if lowered.startswith("apikey ") and api_key_matches(auth[7:].strip()):
-            valid = True
-        if lowered.startswith("bearer ") and api_key_matches(auth[7:].strip()):
-            valid = True
-
-    if not valid:
+    if not auth.is_authorized(authorization, x_api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
