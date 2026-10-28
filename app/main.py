@@ -22,7 +22,19 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from app.core import auth, booking, config, loads, negotiation, otp, verification
-from app.mcp_server import mcp, mcp_app
+
+# The MCP surface must never take the HTTP surface down (user story
+# 13: the production voice workflow keeps working even if the MCP
+# experiment is broken): a broken or missing mcp package — or any
+# other failure importing the MCP module — demotes the app to
+# HTTP-only with one logged warning. No switch to turn the MCP
+# surface off exists; this is runtime resilience only.
+try:
+    from app.mcp_server import mcp, mcp_app
+except Exception as exc:
+    mcp = None
+    mcp_app = None
+    print(f"[MCP] surface unavailable: {exc}")
 
 # Configuration lives in the framework-agnostic core layer; the names
 # below are re-exported here so existing importers (and the test
@@ -53,10 +65,31 @@ async def lifespan(app: FastAPI):
 
     Runs the MCP session manager for the life of the process: the
     mounted streamable-HTTP surface has no sessions — and cannot
-    serve requests — unless its session manager is running.
+    serve requests — unless its session manager is running. If the
+    MCP surface is unavailable (its import failed, or the session
+    manager fails to start), a one-line warning is logged and the
+    HTTP surface keeps serving — user story 13.
     """
-    async with mcp.session_manager.run():
+    if mcp is None:
+        # The MCP surface failed to import at startup; HTTP only.
         yield
+        return
+
+    try:
+        manager = mcp.session_manager.run()
+        await manager.__aenter__()
+    except Exception as exc:
+        print(f"[MCP] surface unavailable: {exc}")
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        try:
+            await manager.__aexit__(None, None, None)
+        except Exception as exc:
+            print(f"[MCP] surface unavailable: {exc}")
 
 
 app = FastAPI(
@@ -129,7 +162,7 @@ def authenticate(authorization: Optional[str], x_api_key: Optional[str]):
         Authorization: Bearer <configured key>
     """
     if not auth.is_authorized(authorization, x_api_key):
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise HTTPException(status_code=401, detail=auth.INVALID_API_KEY_DETAIL)
 
 
 # ============================================================
@@ -200,11 +233,13 @@ def search_loads(
 ):
     authenticate(authorization, x_api_key)
     return loads.search_loads(
-        request.origin,
-        request.destination,
-        request.equipment_type,
-        request.pickup_date,
-        request.exclude_load_ids,
+        loads.LoadQuery(
+            origin=request.origin,
+            destination=request.destination,
+            equipment_type=request.equipment_type,
+            pickup_date=request.pickup_date,
+            exclude_load_ids=request.exclude_load_ids,
+        )
     )
 
 
@@ -283,7 +318,10 @@ def tms_raw(
 # sub-application enforces the same shared API key as the HTTP
 # surface (app.mcp_server.McpApiKeyMiddleware); its session
 # manager runs in the lifespan above. Health, root, and the
-# dev-only raw TMS passthrough stay outside the MCP surface.
+# dev-only raw TMS passthrough stay outside the MCP surface. If
+# the MCP surface failed to import (see the guarded import above),
+# there is nothing to mount and the HTTP surface stands alone.
 # ============================================================
 
-app.mount("/mcp", mcp_app)
+if mcp_app is not None:
+    app.mount("/mcp", mcp_app)

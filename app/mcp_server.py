@@ -79,7 +79,13 @@ def search_loads(
 ) -> dict:
     """Call only after the caller is verified, once you know their current location or origin and their equipment type. If the caller already gave these earlier in the call, including before verification, call this right after verification without asking again. Include destination and pickup date only if the caller offered them. Returns matching available loads, best match first, with lane, dates, equipment, weight, commodity and posted rate. It never returns a maximum rate."""
     return loads.search_loads(
-        origin, destination, equipment_type, pickup_date, exclude_load_ids
+        loads.LoadQuery(
+            origin=origin,
+            destination=destination,
+            equipment_type=equipment_type,
+            pickup_date=pickup_date,
+            exclude_load_ids=exclude_load_ids,
+        )
     )
 
 
@@ -125,7 +131,8 @@ class McpApiKeyMiddleware:
         if not auth.is_authorized(
             headers.get("authorization"), headers.get("x-api-key")
         ):
-            body = b'{"detail": "Invalid API key"}'
+            # The same 401 body the HTTP surface emits (app.core.auth).
+            body = auth.INVALID_API_KEY_BODY
             await send(
                 {
                     "type": "http.response.start",

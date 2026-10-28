@@ -440,28 +440,28 @@ def say(text):
     # Pause tokens are for the voice engine; show them as a short pause in the terminal.
     print(f"Nico: {text.replace('<|pause_short|>', '…')}")
 
-def _spoken_text(content):
-    """The model's spoken text; content may be a string or content blocks."""
+def _content_text(content, separator=""):
+    """
+    A message's text: a string as-is, content blocks joined with
+    `separator`, anything else stringified.
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "".join(
+        return separator.join(
             block["text"]
             for block in content
             if isinstance(block, dict) and block.get("type") == "text"
         )
     return "" if content is None else str(content)
 
+def _spoken_text(content):
+    """The model's spoken text; content may be a string or content blocks."""
+    return _content_text(content)
+
 def _tool_result_text(message):
     """A tool result's text (a ToolMessage's content may be content blocks)."""
-    content = message.content
-    if isinstance(content, list):
-        return " ".join(
-            block["text"]
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
-    return content if content is not None else ""
+    return _content_text(message.content, separator=" ")
 
 def debug_tool_result(message):
     """Print a tool result in the old call_endpoint "<-" debug shape."""

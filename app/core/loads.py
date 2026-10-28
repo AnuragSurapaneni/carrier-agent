@@ -6,7 +6,9 @@ test loads (adversarial lanes) first, then a live TMS LOAD_QUERY,
 with state-level filtering and MAX_BUY-free formatting.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Optional
 
 from app.core import config
 from app.core.text import (
@@ -78,13 +80,30 @@ def find_test_loads(orig_city, orig_state, dest_city, dest_state,
     return results
 
 
-def search_loads(origin, destination, equipment_type, pickup_date,
-                 exclude_load_ids) -> dict:
+@dataclass
+class LoadQuery:
+    """
+    One load search, as the core layer sees it.
+
+    The two protocol adapters build it from their own argument
+    shapes (the HTTP request model, the MCP tool's flat parameters)
+    and hand it to search_loads, so the five search params travel
+    as one named value instead of positionally. Fields the adapters
+    may leave unset are Optional — clean() normalizes them.
+    """
+    origin: Optional[str]
+    destination: Optional[str]
+    equipment_type: Optional[str]
+    pickup_date: Optional[str]
+    exclude_load_ids: Optional[str]
+
+
+def search_loads(query: LoadQuery) -> dict:
     """Search loads; returns the /search-loads response dict."""
-    origin = clean(origin)
-    destination = clean(destination)
-    equipment = clean(equipment_type)
-    pickup_date = clean(pickup_date)
+    origin = clean(query.origin)
+    destination = clean(query.destination)
+    equipment = clean(query.equipment_type)
+    pickup_date = clean(query.pickup_date)
 
     # TMS requires at least one filter.
     if not origin and not destination and not equipment and not pickup_date:
@@ -95,7 +114,7 @@ def search_loads(origin, destination, equipment_type, pickup_date,
 
     excluded = {
         item.strip()
-        for item in clean(exclude_load_ids).split(",")
+        for item in clean(query.exclude_load_ids).split(",")
         if item.strip()
     }
 

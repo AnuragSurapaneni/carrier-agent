@@ -8,9 +8,22 @@ shared API key, so no protocol can accept what another rejects.
 """
 
 import hmac
+import json
 from typing import Optional
 
 from app.core.config import API_KEY
+
+# The 401 response every protocol surface must emit, byte for byte:
+# the detail string and its JSON body. The body is rendered exactly
+# the way the HTTP surface renders it — starlette's JSONResponse
+# separators — so what HTTPException(status_code=401,
+# detail=INVALID_API_KEY_DETAIL) sends and what the MCP ASGI
+# middleware (outside the HTTP adapter) sends directly are the same
+# bytes.
+INVALID_API_KEY_DETAIL = "Invalid API key"
+INVALID_API_KEY_BODY = json.dumps(
+    {"detail": INVALID_API_KEY_DETAIL}, separators=(",", ":")
+).encode("utf-8")
 
 
 def api_key_matches(value: str) -> bool:
